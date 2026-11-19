@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tigeropen"
+dynamic = ["version"]
+description = "TigerBrokers Open API Python SDK"
+readme = {file = "README.md", content-type = "text/markdown"}
+license = {text = "Apache-2.0"}
+requires-python = ">=3.8"
+authors = [
+    {name = "TigerBrokers", email = "openapi@itiger.com"},
+]
+keywords = ["tiger", "brokers", "openapi", "trading", "quant", "finance"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: Unix",
+    "Operating System :: MacOS",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "simplejson>=3.20.2",
+    "delorean",
+    "pandas",
+    "python-dateutil",
+    "pytz",
+    "pyasn1>=0.6.5",
+    "rsa",
+    "stomp.py",
+    "getmac",
+    "cryptography",
+    "backoff",
+    "jproperties",
+    "protobuf",
+    "urllib3",
+    "click>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/tigerfintech/openapi-python-sdk"
+Documentation = "https://docs.itigerup.com/docs/"
+Repository = "https://github.com/tigerfintech/openapi-python-sdk"
+Issues = "https://github.com/tigerfintech/openapi-python-sdk/issues"
+
+[project.scripts]
+tigeropen = "tigeropen.cli.main:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "tigeropen.__VERSION__"}
+
+[tool.setuptools.packages.find]
+# pyproject 配置下 packages.find 默认 namespaces = true，任何目录都会被当成包 ——
+# 不显式 include 的话 build/、dist/、logs/ 都会被打进产物（3.8.0 首次构建就把
+# dist/*.tar.gz、build/lib/build/lib/... 递归打进了 wheel，6MB 里大半是垃圾）。
+include = ["tigeropen*", "scripts*"]
+# __pycache__ 同样会被当成命名空间包，不排掉的话源码树里残留的 .pyc 会进 wheel。
+exclude = ["tests*", "build*", "dist*", "logs*", "*__pycache__*"]
+
+[tool.setuptools.package-data]
+# 按扩展名列举，不要用 "*.*" / "**/*.*" —— 那会把 __pycache__/*.pyc 一并打进去。
+"*" = ["*.proto", "*.pyi", "*.md", "MANIFEST.in"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# marker 语义是「这个用例需要什么」，不是「它属于哪一层」。分层由 TIGER_RUN_INTEG 决定，
+# 完整说明见 tests/conftest.py
+markers = [
+    "unit: 永远不碰真实接口的用例（纯函数、序列化、配置解析等）",
+    "integ: 涉及写操作的真实接口用例，只应手动或定时触发",
+]

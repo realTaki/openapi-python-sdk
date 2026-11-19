@@ -4,332 +4,352 @@ Created on 2018/10/30
 
 @author: gaoan
 """
-import json
-import logging
-import sys
-from collections import defaultdict
-
-import stomp
-from stomp.exception import ConnectFailedException
-
-from tigeropen import __VERSION__
-from tigeropen.common.consts import OrderStatus
-from tigeropen.common.consts.params import P_SDK_VERSION, P_SDK_VERSION_PREFIX
-from tigeropen.common.consts.push_destinations import QUOTE, QUOTE_DEPTH, QUOTE_FUTURE, QUOTE_OPTION, TRADE_ASSET, \
-    TRADE_ORDER, TRADE_POSITION
-from tigeropen.common.consts.push_subscriptions import SUBSCRIPTION_QUOTE, SUBSCRIPTION_QUOTE_DEPTH, \
-    SUBSCRIPTION_QUOTE_OPTION, SUBSCRIPTION_QUOTE_FUTURE, SUBSCRIPTION_TRADE_ASSET, SUBSCRIPTION_TRADE_POSITION, \
-    SUBSCRIPTION_TRADE_ORDER
-from tigeropen.common.consts.push_types import RequestType, ResponseType
-from tigeropen.common.consts.quote_keys import QuoteChangeKey, QuoteKeyType
-from tigeropen.common.util.string_utils import camel_to_underline
+from tigeropen.auth.authentication import AuthenticationType
 from tigeropen.common.util.common_utils import get_enum_value
-from tigeropen.common.util.order_utils import get_order_status
-from tigeropen.common.util.signature_utils import sign_with_rsa
-
-HOUR_TRADING_QUOTE_KEYS_MAPPINGS = {'hourTradingLatestPrice': 'latest_price', 'hourTradingPreClose': 'pre_close',
-                                    'hourTradingLatestTime': 'latest_time', 'hourTradingVolume': 'volume',
-                                    }
-QUOTE_KEYS_MAPPINGS = {field.value: field.name for field in QuoteChangeKey}  # like {'askPrice': 'ask_price'}
-QUOTE_KEYS_MAPPINGS.update(HOUR_TRADING_QUOTE_KEYS_MAPPINGS)
-PRICE_FIELDS = {'open', 'high', 'low', 'close', 'prev_close', 'ask_price', 'bid_price', 'latest_price'}
-
-ASSET_KEYS_MAPPINGS = {'buyingPower': 'buying_power', 'cashBalance': 'cash',
-                       'grossPositionValue': 'gross_position_value',
-                       'netLiquidation': 'net_liquidation', 'equityWithLoan': 'equity_with_loan',
-                       'initMarginReq': 'initial_margin_requirement',
-                       'maintMarginReq': 'maintenance_margin_requirement',
-                       'availableFunds': 'available_funds', 'excessLiquidity': 'excess_liquidity',
-                       'dayTradesRemaining': 'day_trades_remaining', 'currency': 'currency', 'segment': 'segment'}
-
-POSITION_KEYS_MAPPINGS = {'averageCost': 'average_cost', 'position': 'quantity', 'latestPrice': 'market_price',
-                          'marketValue': 'market_value', 'orderType': 'order_type', 'realizedPnl': 'realized_pnl',
-                          'unrealizedPnl': 'unrealized_pnl', 'secType': 'sec_type', 'localSymbol': 'local_symbol',
-                          'originSymbol': 'origin_symbol', 'contractId': 'contract_id', 'symbol': 'symbol',
-                          'currency': 'currency', 'strike': 'strike', 'expiry': 'expiry', 'right': 'right',
-                          'segment': 'segment', 'identifier': 'identifier'}
-
-ORDER_KEYS_MAPPINGS = {'parentId': 'parent_id', 'orderId': 'order_id', 'orderType': 'order_type',
-                       'limitPrice': 'limit_price', 'auxPrice': 'aux_price', 'avgFillPrice': 'avg_fill_price',
-                       'totalQuantity': 'quantity', 'filledQuantity': 'filled', 'lastFillPrice': 'last_fill_price',
-                       'realizedPnl': 'realized_pnl', 'secType': 'sec_type', 'symbol': 'symbol',
-                       'remark': 'reason', 'localSymbol': 'local_symbol', 'originSymbol': 'origin_symbol',
-                       'outsideRth': 'outside_rth', 'timeInForce': 'time_in_force', 'openTime': 'order_time',
-                       'latestTime': 'trade_time', 'contractId': 'contract_id', 'trailStopPrice': 'trail_stop_price',
-                       'trailingPercent': 'trailing_percent', 'percentOffset': 'percent_offset', 'action': 'action',
-                       'status': 'status', 'currency': 'currency', 'remaining': 'remaining', 'id': 'id',
-                       'segment': 'segment', 'identifier': 'identifier', 'replaceStatus': 'replace_status'}
-
-if sys.platform == 'linux' or sys.platform == 'linux2':
-    KEEPALIVE = True
-else:
-    KEEPALIVE = False
+from tigeropen.push.protobuf_push_client import ProtobufPushClient
+from tigeropen.push.stomp_push_client import StompPushClient
 
 
-class PushClient(stomp.ConnectionListener):
-    def __init__(self, host, port, use_ssl=True, connection_timeout=120, auto_reconnect=True,
-                 heartbeats=(30 * 1000, 30 * 1000)):
+def _is_oauth2(client_config):
+    authentication = getattr(client_config, 'authentication', None) if client_config else None
+    return authentication is not None and authentication.auth_type == AuthenticationType.OAUTH2
+
+
+class PushClient:
+    def __init__(self, host, port, use_ssl=True, connection_timeout=30, heartbeats=(10 * 1000, 10 * 1000),
+                 use_protobuf=True, client_config=None, callback_executor=None):
         """
         :param host:
         :param port:
         :param use_ssl:
-        :param connection_timeout: second
-        :param auto_reconnect:
+        :param connection_timeout: unit: second. The timeout value should be greater the heartbeats interval
         :param heartbeats: tuple of millisecond
+        :param use_protobuf: use stomp protocol or protobuf
+        :param callback_executor: executor for callback
         """
-        self.host = host
-        self.port = port
-        self.use_ssl = use_ssl
-        self._tiger_id = None
-        self._private_key = None
-        self._sign = None
-        self._stomp_connection = None
-        self._destination_counter_map = defaultdict(lambda: 0)
+        self._oauth2_mode = _is_oauth2(client_config)
+        self._use_protobuf = use_protobuf
+        if self._oauth2_mode and not use_protobuf:
+            # A STOMP frame has nowhere to carry a token and the protocol has no
+            # REFRESH_TOKEN equivalent, so OAuth2 is protobuf-only. Rejected here rather
+            # than on connect, where the server would treat it as an unsigned signature
+            # request and report something that points nowhere near the real cause.
+            raise ValueError('OAuth2 authentication requires the protobuf protocol; '
+                             'use_protobuf=False (STOMP) is not supported')
+        if use_protobuf:
+            self.client = ProtobufPushClient(host=host, port=port, use_ssl=use_ssl,
+                                             connection_timeout=connection_timeout,
+                                             heartbeats=heartbeats, client_config=client_config,
+                                             callback_executor=callback_executor)
+        else:
+            self.client = StompPushClient(host=host, port=port, use_ssl=use_ssl, connection_timeout=connection_timeout,
+                                          heartbeats=heartbeats)
 
-        self.subscribed_symbols = None
-        self.quote_changed = None
-        self.asset_changed = None
-        self.position_changed = None
-        self.order_changed = None
-        self.connect_callback = None
-        self.disconnect_callback = None
-        self.subscribe_callback = None
-        self.unsubscribe_callback = None
-        self.error_callback = None
-        self._connection_timeout = connection_timeout
-        self._auto_reconnect = auto_reconnect
-        self._heartbeats = heartbeats
+    def _require_protobuf(self, param_name):
+        """STOMP 协议的订阅帧没有承载该参数的位置，且 STOMP 已停止维护，
+        这里直接报错，而不是把参数悄悄丢掉。
+        """
+        if not self._use_protobuf:
+            raise ValueError('{} requires the protobuf protocol; '
+                             'use_protobuf=False (STOMP) is not supported'.format(param_name))
 
-    def _connect(self):
-        try:
-            if self._stomp_connection:
-                self._stomp_connection.remove_listener('push')
-                self._stomp_connection.transport.cleanup()
-        except:
-            pass
+    @property
+    def subscribed_symbols(self):
+        """deprecated, use query_subscribed_callback instead"""
+        return self.client.subscribed_symbols
 
-        self._stomp_connection = stomp.Connection12(host_and_ports=[(self.host, self.port), ], use_ssl=self.use_ssl,
-                                                    keepalive=KEEPALIVE, timeout=self._connection_timeout,
-                                                    heartbeats=self._heartbeats)
-        self._stomp_connection.set_listener('push', self)
-        self._stomp_connection.start()
-        try:
-            self._stomp_connection.connect(self._tiger_id, self._sign, wait=True, headers=self._generate_headers())
-        except ConnectFailedException as e:
-            raise e
+    @subscribed_symbols.setter
+    def subscribed_symbols(self, value):
+        self.client.subscribed_symbols = value
 
-    def connect(self, tiger_id, private_key):
-        self._tiger_id = tiger_id
-        self._private_key = private_key
-        self._sign = sign_with_rsa(self._private_key, self._tiger_id, 'utf-8')
-        self._connect()
+    @property
+    def query_subscribed_callback(self):
+        return self.client.query_subscribed_callback
+
+    @query_subscribed_callback.setter
+    def query_subscribed_callback(self, value):
+        self.client.query_subscribed_callback = value
+
+    @property
+    def quote_changed(self):
+        return self.client.quote_changed
+
+    @quote_changed.setter
+    def quote_changed(self, value):
+        self.client.quote_changed = value
+
+    @property
+    def quote_bbo_changed(self):
+        return self.client.quote_bbo_changed
+
+    @quote_bbo_changed.setter
+    def quote_bbo_changed(self, value):
+        self.client.quote_bbo_changed = value
+
+    @property
+    def quote_depth_changed(self):
+        return self.client.quote_depth_changed
+
+    @quote_depth_changed.setter
+    def quote_depth_changed(self, value):
+        self.client.quote_depth_changed = value
+
+    @property
+    def tick_changed(self):
+        return self.client.tick_changed
+
+    @tick_changed.setter
+    def tick_changed(self, value):
+        self.client.tick_changed = value
+
+    @property
+    def stock_top_changed(self):
+        return self.client.stock_top_changed
+
+    @stock_top_changed.setter
+    def stock_top_changed(self, value):
+        self.client.stock_top_changed = value
+
+    @property
+    def option_top_changed(self):
+        return self.client.option_top_changed
+
+    @option_top_changed.setter
+    def option_top_changed(self, value):
+        self.client.option_top_changed = value
+
+    @property
+    def kline_changed(self):
+        return self.client.kline_changed
+
+    @kline_changed.setter
+    def kline_changed(self, value):
+        self.client.kline_changed = value
+
+    @property
+    def cc_changed(self):
+        return self.client.cc_changed
+
+    @cc_changed.setter
+    def cc_changed(self, value):
+        self.client.cc_changed = value
+
+    @property
+    def cc_bbo_changed(self):
+        return self.client.cc_bbo_changed
+
+    @cc_bbo_changed.setter
+    def cc_bbo_changed(self, value):
+        self.client.cc_bbo_changed = value
+
+    @property
+    def full_tick_changed(self):
+        return self.client.full_tick_changed
+
+    @full_tick_changed.setter
+    def full_tick_changed(self, value):
+        self.client.full_tick_changed = value
+
+    @property
+    def asset_changed(self):
+        return self.client.asset_changed
+
+    @asset_changed.setter
+    def asset_changed(self, value):
+        self.client.asset_changed = value
+
+    @property
+    def position_changed(self):
+        return self.client.position_changed
+
+    @position_changed.setter
+    def position_changed(self, value):
+        self.client.position_changed = value
+
+    @property
+    def order_changed(self):
+        return self.client.order_changed
+
+    @order_changed.setter
+    def order_changed(self, value):
+        self.client.order_changed = value
+
+    @property
+    def transaction_changed(self):
+        return self.client.transaction_changed
+
+    @transaction_changed.setter
+    def transaction_changed(self, value):
+        self.client.transaction_changed = value
+
+    @property
+    def connect_callback(self):
+        return self.client.connect_callback
+
+    @connect_callback.setter
+    def connect_callback(self, value):
+        self.client.connect_callback = value
+
+    @property
+    def disconnect_callback(self):
+        return self.client.disconnect_callback
+
+    @disconnect_callback.setter
+    def disconnect_callback(self, value):
+        self.client.disconnect_callback = value
+
+    @property
+    def subscribe_callback(self):
+        return self.client.subscribe_callback
+
+    @subscribe_callback.setter
+    def subscribe_callback(self, value):
+        self.client.subscribe_callback = value
+
+    @property
+    def unsubscribe_callback(self):
+        return self.client.unsubscribe_callback
+
+    @unsubscribe_callback.setter
+    def unsubscribe_callback(self, value):
+        self.client.unsubscribe_callback = value
+
+    @property
+    def error_callback(self):
+        return self.client.error_callback
+
+    @error_callback.setter
+    def error_callback(self, value):
+        self.client.error_callback = value
+
+    @property
+    def kickout_callback(self):
+        return self.client.kickout_callback
+
+    @kickout_callback.setter
+    def kickout_callback(self, value):
+        self.client.kickout_callback = value
+
+    @property
+    def heartbeat_callback(self):
+        return self.client.on_heartbeat
+
+    @heartbeat_callback.setter
+    def heartbeat_callback(self, value):
+        self.client.heartbeat_callback = value
+
+    def connect(self, tiger_id=None, private_key=None):
+        """
+        :param tiger_id: required in signature mode; unused in OAuth2 mode
+        :param private_key: required in signature mode; unused in OAuth2 mode
+        """
+        self.client.connect(tiger_id=tiger_id, private_key=private_key)
 
     def disconnect(self):
-        if self._stomp_connection:
-            self._stomp_connection.disconnect()
+        self.client.disconnect()
 
-    def on_connected(self, headers, body):
-        if self.connect_callback:
-            self.connect_callback()
+    def on_connected(self, frame):
+        self.client.on_connected(frame)
 
     def on_disconnected(self):
-        if self.disconnect_callback:
-            self.disconnect_callback()
-        elif self._auto_reconnect:
-            self._connect()
+        self.client.on_disconnected()
 
-    def on_message(self, headers, body):
-        """
-        Called by the STOMP connection when a MESSAGE frame is received.
+    def on_message(self, frame):
+        self.client.on_message(frame)
 
-        :param dict headers: a dictionary containing all headers sent by the server as key/value pairs.
-        :param body: the frame's payload - the message body.
-        """
-        try:
-            response_type = headers.get('ret-type')
-            if response_type == str(ResponseType.GET_SUB_SYMBOLS_END.value):
-                if self.subscribed_symbols:
-                    data = json.loads(body)
-                    limit = data.get('limit')
-                    symbols = data.get('subscribedSymbols')
-                    used = data.get('used')
-                    symbol_focus_keys = data.get('symbolFocusKeys')
-                    focus_keys = dict()
-                    for sym, keys in symbol_focus_keys.items():
-                        keys = set(QUOTE_KEYS_MAPPINGS.get(key, camel_to_underline(key)) for key in keys)
-                        focus_keys[sym] = list(keys)
-                    self.subscribed_symbols(symbols, focus_keys, limit, used)
-            elif response_type == str(ResponseType.GET_QUOTE_CHANGE_END.value):
-                if self.quote_changed:
-                    data = json.loads(body)
-                    hour_trading = False
-                    if 'hourTradingLatestPrice' in data:
-                        hour_trading = True
-                    if 'symbol' in data:
-                        symbol = data.pop('symbol', None)
-                        offset = data.get('offset', 0)
-                        items = []
-                        # 期货行情推送的价格都乘了 10 的 offset 次方变成了整数, 需要除回去变为正常单位的价格
-                        if offset:
-                            for key, value in data.items():
-                                if key == 'latestTime' or key == 'hourTradingLatestTime':
-                                    continue
-                                if key in QUOTE_KEYS_MAPPINGS:
-                                    key = QUOTE_KEYS_MAPPINGS.get(key)
-                                    if key in PRICE_FIELDS:
-                                        value /= 10 ** offset
-                                    elif key == 'minute':
-                                        minute_item = dict()
-                                        for m_key, m_value in value.items():
-                                            if m_key in {'p', 'h', 'l'}:
-                                                m_value /= 10 ** offset
-                                            minute_item[m_key] = m_value
-                                            value = minute_item
-                                    items.append((key, value))
-                                else:
-                                    items.append((camel_to_underline(key), value))
-                        else:
-                            for key, value in data.items():
-                                if key == 'latestTime' or key == 'hourTradingLatestTime':
-                                    continue
-                                if key in QUOTE_KEYS_MAPPINGS:
-                                    key = QUOTE_KEYS_MAPPINGS.get(key)
-                                    items.append((key, value))
-                                else:
-                                    items.append((camel_to_underline(key), value))
-                        if items:
-                            self.quote_changed(symbol, items, hour_trading)
-            elif response_type == str(ResponseType.SUBSCRIBE_ASSET.value):
-                if self.asset_changed:
-                    data = json.loads(body)
-                    if 'account' in data:
-                        account = data.pop('account', None)
-                        items = []
-                        for key, value in data.items():
-                            if key in ASSET_KEYS_MAPPINGS:
-                                items.append((ASSET_KEYS_MAPPINGS.get(key), value))
-                            else:
-                                items.append((camel_to_underline(key), value))
-                        if items:
-                            self.asset_changed(account, items)
-            elif response_type == str(ResponseType.SUBSCRIBE_POSITION.value):
-                if self.position_changed:
-                    data = json.loads(body)
-                    if 'account' in data:
-                        account = data.pop('account', None)
-                        items = []
-                        for key, value in data.items():
-                            if key in POSITION_KEYS_MAPPINGS:
-                                items.append((POSITION_KEYS_MAPPINGS.get(key), value))
-                            else:
-                                items.append((camel_to_underline(key), value))
-                        if items:
-                            self.position_changed(account, items)
-            elif response_type == str(ResponseType.SUBSCRIBE_ORDER_STATUS.value):
-                if self.order_changed:
-                    data = json.loads(body)
-                    if 'account' in data:
-                        account = data.pop('account', None)
-                        items = []
-                        for key, value in data.items():
-                            if key in ORDER_KEYS_MAPPINGS:
-                                if key == 'status':
-                                    value = get_order_status(value)
-                                    # 部分成交 (服务端推送 'Submitted' 状态)
-                                    if value == OrderStatus.HELD and data.get('filledQuantity'):
-                                        value = OrderStatus.PARTIALLY_FILLED
-                                items.append((ORDER_KEYS_MAPPINGS.get(key), value))
-                            else:
-                                items.append((camel_to_underline(key), value))
-                        if items:
-                            self.order_changed(account, items)
-            elif response_type == str(ResponseType.GET_SUBSCRIBE_END.value):
-                if self.subscribe_callback:
-                    self.subscribe_callback(headers.get('destination'), json.loads(body))
-            elif response_type == str(ResponseType.GET_CANCEL_SUBSCRIBE_END.value):
-                if self.unsubscribe_callback:
-                    self.unsubscribe_callback(headers.get('destination'), json.loads(body))
-            elif response_type == str(ResponseType.ERROR_END.value):
-                if self.error_callback:
-                    self.error_callback(body)
-        except Exception as e:
-            logging.error(e, exc_info=True)
+    def on_error(self, frame):
+        self.client.on_error(frame)
 
-    def on_error(self, headers, body):
-        if self.error_callback:
-            self.error_callback(body)
-        else:
-            logging.error(body)
-
-    def _update_subscribe_id(self, destination):
-        self._destination_counter_map[destination] += 1
-
-    def _get_subscribe_id(self, destination):
-        return 'sub-' + str(self._destination_counter_map[destination])
-
-    def subscribe_asset(self, account=None):
+    def subscribe_asset(self, account=None, asset_quote_type=None):
         """
         订阅账户资产更新
+        :param account: 账户
+        :param asset_quote_type: 资产行情模式. tigeropen.common.consts.AssetQuoteType 或其枚举名
+            字符串 (ETH/RTH/OVERNIGHT). 仅 protobuf 协议支持
         :return:
         """
-        return self._handle_trade_subscribe(TRADE_ASSET, SUBSCRIPTION_TRADE_ASSET, account)
+        if not asset_quote_type:
+            # 空串同样按「不传」处理，与交易侧 get_assets/get_prime_assets 的真值判定一致；
+            # 否则 proto3 optional 会带 presence 把一个长度为 0 的 assetQuoteType 发上去
+            # 不传时保持原有调用形态，STOMP 客户端也能照常工作
+            return self.client.subscribe_asset(account=account)
+        self._require_protobuf('asset_quote_type')
+        return self.client.subscribe_asset(account=account, asset_quote_type=get_enum_value(asset_quote_type))
 
-    def unsubscribe_asset(self, id=None):
+    def unsubscribe_asset(self):
         """
         退订账户资产更新
         :return:
         """
-        self._handle_trade_unsubscribe(TRADE_ASSET, SUBSCRIPTION_TRADE_ASSET, sub_id=id)
+        self.client.unsubscribe_asset()
 
-    def subscribe_position(self, account=None):
+    def subscribe_position(self, account=None, asset_quote_type=None):
         """
         订阅账户持仓更新
+        :param account: 账户
+        :param asset_quote_type: 资产行情模式. tigeropen.common.consts.AssetQuoteType 或其枚举名
+            字符串 (ETH/RTH/OVERNIGHT). 仅 protobuf 协议支持
         :return:
         """
-        return self._handle_trade_subscribe(TRADE_POSITION, SUBSCRIPTION_TRADE_POSITION, account)
+        if not asset_quote_type:
+            # 空串同样按「不传」处理，与交易侧 get_assets/get_prime_assets 的真值判定一致；
+            # 否则 proto3 optional 会带 presence 把一个长度为 0 的 assetQuoteType 发上去
+            # 不传时保持原有调用形态，STOMP 客户端也能照常工作
+            return self.client.subscribe_position(account=account)
+        self._require_protobuf('asset_quote_type')
+        return self.client.subscribe_position(account=account, asset_quote_type=get_enum_value(asset_quote_type))
 
-    def unsubscribe_position(self, id=None):
+    def unsubscribe_position(self):
         """
         退订账户持仓更新
         :return:
         """
-        self._handle_trade_unsubscribe(TRADE_POSITION, SUBSCRIPTION_TRADE_POSITION, sub_id=id)
+        self.client.unsubscribe_position()
 
     def subscribe_order(self, account=None):
         """
         订阅账户订单更新
         :return:
         """
-        return self._handle_trade_subscribe(TRADE_ORDER, SUBSCRIPTION_TRADE_ORDER, account)
+        return self.client.subscribe_order(account=account)
 
-    def unsubscribe_order(self, id=None):
+    def unsubscribe_order(self):
         """
         退订账户订单更新
         :return:
         """
-        self._handle_trade_unsubscribe(TRADE_ORDER, SUBSCRIPTION_TRADE_ORDER, sub_id=id)
+        self.client.unsubscribe_order()
 
-    def subscribe_quote(self, symbols, quote_key_type=QuoteKeyType.TRADE, focus_keys=None):
+    def subscribe_transaction(self, account=None):
+        """
+        订阅订单执行明细
+        :return:
+        """
+        return self.client.subscribe_transaction(account=account)
+
+    def unsubscribe_transaction(self):
+        """
+        退订订单执行明细
+        :return:
+        """
+        self.client.unsubscribe_transaction()
+
+    def subscribe_quote(self, symbols, **kwargs):
         """
         订阅行情更新
         :param symbols:
-        :param quote_key_type: 行情类型, 值为 common.consts.quote_keys.QuoteKeyType 枚举类型
-        :param focus_keys: 行情 key, common.consts.quote_keys.QuoteChangeKey 枚举类型的列表
         :return:
         """
-        extra_headers = dict()
-        if focus_keys:
-            if isinstance(focus_keys, list):
-                keys = list()
-                for key in focus_keys:
-                    keys.append(get_enum_value(key))
-                extra_headers['keys'] = ','.join(keys)
-            else:
-                extra_headers['keys'] = focus_keys
-        elif quote_key_type:
-            extra_headers['keys'] = get_enum_value(quote_key_type)
-        return self._handle_quote_subscribe(destination=QUOTE, subscription=SUBSCRIPTION_QUOTE, symbols=symbols,
-                                            extra_headers=extra_headers)
+
+        return self.client.subscribe_quote(symbols=symbols)
+
+    def subscribe_tick(self, symbols):
+        """
+        subscribe trade tick
+        :param symbols: symbol列表
+        :return:
+        """
+        return self.client.subscribe_tick(symbols=symbols)
 
     def subscribe_depth_quote(self, symbols):
         """
@@ -337,7 +357,7 @@ class PushClient(stomp.ConnectionListener):
         :param symbols: symbol列表
         :return:
         """
-        return self._handle_quote_subscribe(destination=QUOTE_DEPTH, subscription=SUBSCRIPTION_QUOTE_DEPTH, symbols=symbols)
+        return self.client.subscribe_depth_quote(symbols=symbols)
 
     def subscribe_option(self, symbols):
         """
@@ -345,7 +365,7 @@ class PushClient(stomp.ConnectionListener):
         :param symbols: symbol列表
         :return:
         """
-        return self._handle_quote_subscribe(destination=QUOTE_OPTION, subscription=SUBSCRIPTION_QUOTE_OPTION, symbols=symbols)
+        return self.client.subscribe_option(symbols=symbols)
 
     def subscribe_future(self, symbols):
         """
@@ -353,79 +373,72 @@ class PushClient(stomp.ConnectionListener):
         :param symbols: symbol列表
         :return:
         """
-        return self._handle_quote_subscribe(destination=QUOTE_FUTURE, subscription=SUBSCRIPTION_QUOTE_FUTURE, symbols=symbols)
+        return self.client.subscribe_future(symbols=symbols)
 
     def query_subscribed_quote(self):
         """
         查询已订阅行情的合约
         :return:
         """
-        headers = self._generate_headers()
-        headers['destination'] = QUOTE
-        headers['req-type'] = RequestType.REQ_SUB_SYMBOLS.value
-        self._stomp_connection.send(QUOTE, "{}", headers=headers)
+        return self.client.query_subscribed_quote()
 
-    def unsubscribe_quote(self, symbols=None, id=None):
+    def unsubscribe_quote(self, symbols=None):
         """
         退订行情更新
         :return:
         """
-        self._handle_quote_unsubscribe(destination=QUOTE, subscription=SUBSCRIPTION_QUOTE, sub_id=id, symbols=symbols)
+        return self.client.unsubscribe_quote(symbols=symbols)
 
-    def unsubscribe_depth_quote(self, symbols=None, id=None):
+    def unsubscribe_tick(self, symbols=None):
+        """
+        退订行情更新
+        :return:
+        """
+        return self.client.unsubscribe_tick(symbols=symbols)
+
+    def unsubscribe_depth_quote(self, symbols=None):
         """
         退订深度行情更新
         :return:
         """
-        self._handle_quote_unsubscribe(destination=QUOTE_DEPTH, subscription=SUBSCRIPTION_QUOTE_DEPTH, sub_id=id, symbols=symbols)
+        self.client.unsubscribe_depth_quote(symbols=symbols)
 
-    def _handle_trade_subscribe(self, destination, subscription, account=None, extra_headers=None):
-        if extra_headers is None:
-            extra_headers = dict()
-        if account is not None:
-            extra_headers['account'] = account
-        return self._handle_subscribe(destination=destination, subscription=subscription, extra_headers=extra_headers)
+    def subscribe_market(self, market):
+        self.client.subscribe_market(market)
 
-    def _handle_quote_subscribe(self, destination, subscription, symbols=None, extra_headers=None):
-        if extra_headers is None:
-            extra_headers = dict()
-        if symbols is not None:
-            extra_headers['symbols'] = ','.join(symbols)
-        return self._handle_subscribe(destination=destination, subscription=subscription, extra_headers=extra_headers)
+    def unsubscribe_market(self, market):
+        self.client.unsubscribe_market(market)
 
-    def _handle_trade_unsubscribe(self, destination, subscription, sub_id=None):
-        self._handle_unsubscribe(destination=destination, subscription=subscription, sub_id=sub_id)
+    def subscribe_stock_top(self, market, indicators=None):
+        self.client.subscribe_stock_top(get_enum_value(market), indicators)
 
-    def _handle_quote_unsubscribe(self, destination, subscription, sub_id=None, symbols=None):
-        extra_headers = dict()
-        if symbols is not None:
-            extra_headers['symbols'] = ','.join(symbols)
-        self._handle_unsubscribe(destination=destination, subscription=subscription, sub_id=sub_id,
-                                 extra_headers=extra_headers)
+    def unsubscribe_stock_top(self, market, indicators=None):
+        self.client.unsubscribe_stock_top(get_enum_value(market), indicators)
 
-    def _handle_subscribe(self, destination, subscription, extra_headers=None):
-        headers = self._generate_headers(extra_headers)
-        headers['destination'] = destination
-        headers['subscription'] = subscription
-        self._update_subscribe_id(destination)
-        sub_id = self._get_subscribe_id(destination)
-        headers['id'] = sub_id
+    def subscribe_option_top(self, market, indicators=None):
+        self.client.subscribe_option_top(get_enum_value(market), indicators)
 
-        self._stomp_connection.subscribe(destination, id=sub_id, headers=headers)
-        return sub_id
+    def unsubscribe_option_top(self, market, indicators=None):
+        self.client.unsubscribe_option_top(get_enum_value(market), indicators)
 
-    def _handle_unsubscribe(self, destination, subscription, sub_id=None, extra_headers=None):
-        headers = self._generate_headers(extra_headers)
-        headers['destination'] = destination
-        headers['subscription'] = subscription
-        id_ = sub_id if sub_id is not None else self._get_subscribe_id(destination)
-        headers['id'] = id_
+    def subscribe_kline(self, symbols=None):
+        self.client.subscribe_kline(symbols)
 
-        self._stomp_connection.unsubscribe(id=id_, headers=headers)
+    def unsubscribe_kline(self, symbols=None):
+        self.client.unsubscribe_kline(symbols)
 
-    def _generate_headers(self, extra_headers=None):
-        headers = {P_SDK_VERSION: P_SDK_VERSION_PREFIX + __VERSION__}
-        if extra_headers is not None:
-            headers.update(extra_headers)
-        return headers
+    def subscribe_cc(self, symbols):
+        """
+        订阅数字货币行情
+        :param symbols: symbol列表
+        :return:
+        """
+        return self.client.subscribe_cc(symbols=symbols)
 
+    def unsubscribe_cc(self, symbols=None):
+        """
+        退订数字货币行情
+        :param symbols: symbol列表
+        :return:
+        """
+        return self.client.unsubscribe_cc(symbols=symbols)

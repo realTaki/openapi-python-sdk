@@ -6,40 +6,44 @@ Created on 2018/9/20
 """
 import logging
 import traceback
+import unittest
 
+from tigeropen.common.util.price_util import PriceUtil
 from tigeropen.trade.domain.order import OrderStatus
 from tigeropen.trade.request.model import AccountsParams
 from tigeropen.tiger_open_client import TigerOpenClient
 from tigeropen.trade.trade_client import TradeClient
 from tigeropen.common.response import TigerResponse
 from tigeropen.common.request import OpenApiRequest
-from tigeropen.common.consts import Currency, SecurityType
+from tigeropen.common.consts import Currency, SecurityType, OrderSortBy, AssetQuoteType
 from tigeropen.common.util.contract_utils import stock_contract, option_contract_by_symbol, future_contract, \
      war_contract_by_symbol, iopt_contract_by_symbol
 from tigeropen.common.util.order_utils import limit_order, limit_order_with_legs, order_leg, algo_order_params, \
     algo_order
-from tigeropen.examples.client_config import get_client_config
+from tigeropen.tiger_open_config import get_client_config
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s',
                     filemode='a', )
 logger = logging.getLogger('TigerOpenApi')
 
-client_config = get_client_config()
+_demo_config = get_client_config(private_key_path='your private key file path',
+                                 tiger_id='your tiger id',
+                                 account='your account')
 
 
 def get_contract_apis():
-    openapi_client = TradeClient(client_config, logger=logger)
+    openapi_client = TradeClient(_demo_config, logger=logger)
     contract = openapi_client.get_contracts('AAPL')[0]
     print(contract)
     contract = openapi_client.get_contract('AAPL', SecurityType.STK, currency=Currency.USD)
     print(contract)
-    # get derivative contracts of stock. include OPT, WAR, IOPT
+    # get derivative option_basics of stock. include OPT, WAR, IOPT
     contracts = openapi_client.get_derivative_contracts('00700', SecurityType.WAR, '20220929')
     print(contracts)
 
 def get_account_apis():
-    openapi_client = TradeClient(client_config, logger=logger)
+    openapi_client = TradeClient(_demo_config, logger=logger)
     openapi_client.get_managed_accounts()
     # 获取订单
     openapi_client.get_orders()
@@ -63,10 +67,43 @@ def get_account_apis():
     # 综合/模拟账户获取资产
     openapi_client.get_prime_assets()
 
+    # 指定资产行情模式(盘前盘后/盘中/夜盘), 持仓与资产接口均可使用
+    # openapi_client.get_positions(asset_quote_type=AssetQuoteType.ETH)
+    # openapi_client.get_assets(asset_quote_type=AssetQuoteType.ETH)
+    # openapi_client.get_prime_assets(asset_quote_type=AssetQuoteType.OVERNIGHT)
+    # openapi_client.get_aggregate_assets(asset_quote_type=AssetQuoteType.RTH)
+
+    # get asset history
+    openapi_client.get_analytics_asset(start_date='2021-12-01', end_date='2021-12-07')
+
+
+def test_get_orders_by_page():
+    """分页获取订单"""
+    trade_client = TradeClient(_demo_config)
+    result = list()
+    # 每次返回数量(需 <= 300)
+    limit = 300
+    conditions = {
+        'limit': limit,
+        'start_time': '2024-12-01',
+        'end_time': '2025-02-12',
+        #  返回数据是按照时间逆序，即最新的数据在前。此处按照下单时间 order_time 排序
+        'sort_by': OrderSortBy.LATEST_CREATED,
+    }
+    orders_page = trade_client.get_orders(**conditions)
+    result.extend(orders_page)
+    while len(orders_page) == limit:
+        next_order_time = orders_page[-1].order_time
+        conditions.pop('end_time', None)
+        orders_page = trade_client.get_orders(**conditions, end_time=next_order_time)
+        result.extend(orders_page)
+    print(f'total order size: {len(result)}')
+    return result
+
 
 def trade_apis():
-    account = client_config.account
-    openapi_client = TradeClient(client_config, logger=logger)
+    account = _demo_config.account
+    openapi_client = TradeClient(_demo_config, logger=logger)
 
     # 通过请求获取合约
     contract = openapi_client.get_contracts('AAPL')[0]
@@ -119,12 +156,19 @@ def trade_apis():
     order_legs = openapi_client.get_open_orders(account, parent_id=main_order.order_id)
     print(order_legs)
 
+    # adjust price by contract tick sizes
+    contract = openapi_client.get_contract('UVXY')
+    price = 10.125
+    if not PriceUtil.match_tick_size(price, contract.tick_sizes):
+        price = PriceUtil.fix_price_by_tick_size(price, contract.tick_sizes)
+
+
 
 def algo_order_demo():
-    account = client_config.account
-    openapi_client = TradeClient(client_config, logger=logger)
+    account = _demo_config.account
+    openapi_client = TradeClient(_demo_config, logger=logger)
     contract = stock_contract(symbol='AAPL', currency='USD')
-    params = algo_order_params(start_time='2020-11-19 23:00:00', end_time='2020-11-19 23:50:00', no_take_liq=True,
+    params = algo_order_params(start_time=1686147201000, end_time=1686150801000, no_take_liq=True,
                                allow_past_end_time=True, participation_rate=0.1)
     order = algo_order(account, contract, 'BUY', 1000, 'VWAP', algo_params=params, limit_price=100.0)
     openapi_client.place_order(order)
@@ -137,9 +181,9 @@ def get_account_info():
     :return:
     """
     from tigeropen.common.consts.service_types import ACCOUNTS
-    openapi_client = TigerOpenClient(client_config)
+    openapi_client = TigerOpenClient(_demo_config)
     account = AccountsParams()
-    account.account = client_config.account
+    account.account = _demo_config.account
     request = OpenApiRequest(method=ACCOUNTS, biz_model=account)
 
     response_content = None
@@ -156,6 +200,33 @@ def get_account_info():
             print("get response data:" + response.data)
         else:
             print("%d,%s,%s" % (response.code, response.message, response.data))
+
+
+class TestTradeClient(unittest.TestCase):
+    trade_client = TradeClient(_demo_config)
+
+    def test_transfer_segment_fund(self):
+        """资金划转"""
+        # 查看可转资金
+        available = self.trade_client.get_segment_fund_available()
+        print(available)
+
+        # 划转资金
+        res = self.trade_client.transfer_segment_fund(from_segment='SEC', to_segment='FUT', amount=100, currency='USD')
+        print(res)
+        # 撤销划转
+        cancelres = self.trade_client.cancel_segment_fund(id=res.id)
+        print(cancelres)
+
+        # 查看资金划转历史
+        history = self.trade_client.get_segment_fund_history()
+        print(history)
+
+    def test_forex_order(self):
+        """换汇"""
+        order = self.trade_client.place_forex_order(seg_type='FUT', source_currency='USD', target_currency='HKD',
+                                               source_amount=50)
+        print(order)
 
 
 if __name__ == '__main__':

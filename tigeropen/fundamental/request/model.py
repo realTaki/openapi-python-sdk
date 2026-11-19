@@ -61,7 +61,7 @@ class FinancialDailyParams(BaseParams):
         self._end_date = value
 
     def to_openapi_dict(self):
-        params = dict()
+        params = super().to_openapi_dict()
 
         if self.symbols:
             params['symbols'] = self.symbols
@@ -91,6 +91,8 @@ class FinancialReportParams(BaseParams):
         self._market = None
         self._fields = None
         self._period_type = None
+        self._begin_date = None
+        self._end_date = None
 
     @property
     def symbols(self):
@@ -124,8 +126,24 @@ class FinancialReportParams(BaseParams):
     def period_type(self, value):
         self._period_type = value
 
+    @property
+    def begin_date(self):
+        return self._begin_date
+
+    @begin_date.setter
+    def begin_date(self, value):
+        self._begin_date = value
+
+    @property
+    def end_date(self):
+        return self._end_date
+
+    @end_date.setter
+    def end_date(self, value):
+        self._end_date = value
+
     def to_openapi_dict(self):
-        params = dict()
+        params = super().to_openapi_dict()
 
         if self.symbols:
             params['symbols'] = self.symbols
@@ -139,8 +157,71 @@ class FinancialReportParams(BaseParams):
         if self.period_type:
             params['period_type'] = self.period_type
 
+        if self.begin_date:
+            params['begin_date'] = self.begin_date
+
+        if self.end_date:
+            params['end_date'] = self.end_date
+
         return params
 
+
+class FinancialExchangeRateParams(BaseParams):
+    def __init__(self):
+        super(FinancialExchangeRateParams, self).__init__()
+        self._currency_list = None
+        self._begin_date = None
+        self._end_date = None
+        self._timezone = None
+
+    @property
+    def currency_list(self):
+        return self._currency_list
+
+    @currency_list.setter
+    def currency_list(self, value):
+        self._currency_list = value
+
+    @property
+    def begin_date(self):
+        return self._begin_date
+
+    @begin_date.setter
+    def begin_date(self, value):
+        self._begin_date = value
+
+    @property
+    def end_date(self):
+        return self._end_date
+
+    @end_date.setter
+    def end_date(self, value):
+        self._end_date = value
+
+    @property
+    def timezone(self):
+        return self._timezone
+
+    @timezone.setter
+    def timezone(self, value):
+        self._timezone = value
+
+    def to_openapi_dict(self):
+        params = super().to_openapi_dict()
+
+        if self.currency_list:
+            params['currency_list'] = self.currency_list
+
+        if self.begin_date:
+            params['begin_date'] = self.begin_date
+
+        if self.end_date:
+            params['end_date'] = self.end_date
+
+        if self.timezone:
+            params['timezone'] = self.timezone
+
+        return params
 
 class CorporateActionParams(BaseParams):
     def __init__(self):
@@ -192,7 +273,7 @@ class CorporateActionParams(BaseParams):
         self._end_date = value
 
     def to_openapi_dict(self):
-        params = dict()
+        params = super().to_openapi_dict()
 
         if self.symbols:
             params['symbols'] = self.symbols
@@ -219,6 +300,7 @@ class IndustryParams(BaseParams):
         self._industry_id = None
         self._market = None
         self._symbol = None
+        self._sec_type = None
 
     @property
     def industry_level(self):
@@ -252,8 +334,16 @@ class IndustryParams(BaseParams):
     def symbol(self, value):
         self._symbol = value
 
+    @property
+    def sec_type(self):
+        return self._sec_type
+
+    @sec_type.setter
+    def sec_type(self, value):
+        self._sec_type = value
+
     def to_openapi_dict(self):
-        params = dict()
+        params = super().to_openapi_dict()
 
         if self.industry_level:
             params['industry_level'] = self.industry_level
@@ -266,5 +356,8 @@ class IndustryParams(BaseParams):
 
         if self.symbol:
             params['symbol'] = self.symbol
+
+        if self.sec_type:
+            params['sec_type'] = self.sec_type
 
         return params

@@ -1,0 +1,42 @@
+syntax = "proto3";
+import public "tigeropen/push/pb/SocketCommon.proto";
+
+package tigeropen.push.pb;
+
+message Request {
+  SocketCommon.Command command = 1;
+  uint32 id = 2;
+  optional Subscribe subscribe = 3;
+  optional Connect connect = 4;
+  optional RefreshToken refreshToken = 5;
+
+  message RefreshToken {
+    string accessToken = 1;
+  }
+
+  message Connect {
+    string tigerId = 1;
+    string sign = 2;
+    string sdkVersion = 3;
+    optional string acceptVersion = 4;
+    optional uint32 sendInterval = 5;
+    optional uint32 receiveInterval = 6;
+    optional bool useFullTick = 7;
+    // 8 and 9 were used by the server-side definition and must not be reused
+    reserved 8, 9;
+    // Set in OAuth2 mode only; left unset in signature mode, so the connect message
+    // stays byte-identical to before
+    optional string accessToken = 10;
+  }
+
+  message Subscribe {
+    SocketCommon.DataType dataType = 1;
+    optional string symbols = 2;
+    optional string account = 3;
+    optional string market = 4;
+    // Asset quote mode, carries the enum name (ETH/RTH/OVERNIGHT). Only meaningful for
+    // the Asset and Position subscriptions; left unset otherwise, and an unset proto3
+    // optional field is not serialized, so existing messages stay byte-identical.
+    optional string assetQuoteType = 5;
+  }
+}

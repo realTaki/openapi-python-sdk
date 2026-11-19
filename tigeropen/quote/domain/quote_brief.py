@@ -13,6 +13,7 @@ class HourTrading:
         self.prev_close = None  # 昨日收盘价
         self.latest_time = None  # 最后交易时间
         self.volume = None  # 成交量
+        self.amount = None  # 成交额
 
         self.open_price = None  # 开盘价
         self.high_price = None  # 最高价
@@ -38,16 +39,17 @@ class QuoteBrief:
         self.prev_close = None  # 昨日收盘价
         self.latest_time = None  # 最后交易时间
         self.volume = None  # 成交量
+        self.amount = None  # 成交额
 
         self.open_price = None  # 开盘价
         self.high_price = None  # 最高价
         self.low_price = None  # 最低价
         self.change = None  # 涨跌额
 
-        self.bid_price = None  # 卖盘价
-        self.bid_size = None  # 卖盘数量
-        self.ask_price = None  # 买盘价
-        self.ask_size = None  # 买盘数量
+        self.bid_price = None  # 买盘价
+        self.bid_size = None  # 买盘数量
+        self.ask_price = None  # 卖盘价
+        self.ask_size = None  # 卖盘数量
 
         self.halted = None  # 是否停牌 0: 正常,3: 停牌,4: 退市
         self.delay = None  # 延时分钟

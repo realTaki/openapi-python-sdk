@@ -6,22 +6,38 @@ Created on 2018/9/20
 """
 import datetime
 import json
+import logging
 import uuid
+from threading import Timer
+
+import backoff
 
 from tigeropen import __VERSION__
+from tigeropen.auth.authentication import AuthenticationType, RequestAuthContext
 from tigeropen.common.consts import OPEN_API_SERVICE_VERSION, THREAD_LOCAL
 from tigeropen.common.consts.params import P_TIMESTAMP, P_TIGER_ID, P_METHOD, P_CHARSET, P_VERSION, P_SIGN_TYPE, \
     P_DEVICE_ID, P_NOTIFY_URL, COMMON_PARAM_KEYS, P_SIGN
+from tigeropen.common.consts.service_types import USER_LICENSE, PLACE_ORDER, CANCEL_ORDER, MODIFY_ORDER, \
+    USER_TOKEN_REFRESH
 from tigeropen.common.exceptions import ResponseException, RequestException
+from tigeropen.common.request import OpenApiRequest
+from tigeropen.common.response import TigerResponse
 from tigeropen.common.util.common_utils import has_value
 from tigeropen.common.util.signature_utils import get_sign_content, sign_with_rsa, verify_with_rsa
 from tigeropen.common.util.web_utils import do_post
+from tigeropen.tiger_open_config import TigerOpenClientConfig
 
-try:
-    from getmac import get_mac_address
-except ImportError:
-    def get_mac_address():
-        return ':'.join(("%012x" % uuid.getnode())[i:i + 2] for i in range(0, 12, 2))
+LOG_FORMATTER = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s')
+SKIP_RETRY_SERVICES = {PLACE_ORDER, CANCEL_ORDER, MODIFY_ORDER}
+UNAUTHORIZED_STATUS = 401
+
+_SCHEDULE_STATE = {'is_running': False}
+
+
+def _giveup_on_unauthorized(e):
+    """A 401 is a credential problem; resending unchanged cannot help. The
+    authentication layer refreshes and retries once instead."""
+    return getattr(e, 'status', None) == UNAUTHORIZED_STATUS
 
 
 class TigerOpenClient:
@@ -30,59 +46,100 @@ class TigerOpenClient:
     logger：日志对象，客户端执行信息会通过此日志对象输出
     """
 
-    def __init__(self, client_config, logger=None):
+    def __init__(self, client_config: TigerOpenClientConfig, logger=None):
         self.__config = client_config
-        self.__logger = logger
+        self.__authentication = getattr(client_config, 'authentication', None)
+        # Cached so it is not re-checked on every request
+        self.__oauth2_mode = self.__authentication is not None \
+            and self.__authentication.auth_type == AuthenticationType.OAUTH2
+        # tiger_id and the private key play no part in OAuth2 mode, so requiring them here
+        # would be wrong
+        if not self.__oauth2_mode:
+            if not client_config.private_key:
+                raise Exception('private key can not be empty')
+            if not client_config.tiger_id:
+                raise Exception('tiger id can not be empty')
+        if logger:
+            if client_config.log_level:
+                logger.setLevel(logging.getLevelName(client_config.log_level))
+            if client_config.log_path:
+                file_handler = logging.FileHandler(client_config.log_path)
+                file_handler.setFormatter(LOG_FORMATTER)
+                logger.addHandler(file_handler)
+            self.__logger = logger
+        user_agent = 'openapi-python-sdk-' + __VERSION__
+        if client_config._channel:
+            user_agent = client_config._channel + ' ' + user_agent
         self.__headers = {
             'Content-type': 'application/json;charset=' + self.__config.charset,
             "Cache-Control": "no-cache",
             "Connection": "Keep-Alive",
-            "User-Agent": 'openapi-python-sdk-' + __VERSION__
+            "User-Agent": user_agent
         }
-        self.__device_id = self.__get_device_id()
+        self._initialize()
 
-    """
-    内部方法，从params中抽取公共参数
-    """
+    def _initialize(self):
+        if not self.__config.inited:
+            self.__logger.info(f'sdk version: {self.__config.sdk_version}')
+            if self.__oauth2_mode:
+                # The license is left unresolved on purpose. It only selects a per-licence
+                # gateway path, and the common gateway serves every licence, so the default
+                # branch of refresh_server_info is the right answer here. Querying it would
+                # work -- under OAuth2 that request carries a Bearer token like any other --
+                # but it would cost a round trip during construction for nothing.
+                self.__logger.info('init with oauth2 authentication')
+            else:
+                self.__init_license()
+            self.__refresh_server_info()
+            # config.token is the HK market-data license token, unrelated to OAuth2, so
+            # its refresh thread is not started in OAuth2 mode
+            if not self.__oauth2_mode and self.__config.token and self.__config.license:
+                self.__schedule_thread()
+            self.__config.inited = True
+
+    def __init_license(self):
+        self.__logger.debug('init license')
+        if self.__config.license is None and self.__config.enable_dynamic_domain:
+            self.__config.license = self.query_license()
+
+    def __refresh_server_info(self):
+        self.__logger.debug('init server info')
+        self.__config.refresh_server_info()
 
     def __get_common_params(self, params):
+        """
+        内部方法，从params中抽取公共参数
+        """
         common_params = dict()
         common_params[P_TIMESTAMP] = params[P_TIMESTAMP]
-        common_params[P_TIGER_ID] = self.__config.tiger_id
+        # OAuth 2.0 requests omit signature fields because their presence selects gateway
+        # signature verification instead of Bearer authentication.
+        if not self.__oauth2_mode:
+            common_params[P_TIGER_ID] = self.__config.tiger_id
         common_params[P_METHOD] = params[P_METHOD]
         common_params[P_CHARSET] = self.__config.charset
         common_params[P_VERSION] = params[P_VERSION] if params.get(P_VERSION) is not None else OPEN_API_SERVICE_VERSION
-        common_params[P_SIGN_TYPE] = self.__config.sign_type
-        common_params[P_DEVICE_ID] = self.__device_id
+        if not self.__oauth2_mode:
+            common_params[P_SIGN_TYPE] = self.__config.sign_type
+        common_params[P_DEVICE_ID] = self.__config._device_id
         if has_value(params, P_NOTIFY_URL):
             common_params[P_NOTIFY_URL] = params[P_NOTIFY_URL]
         return common_params
 
-    @staticmethod
-    def __get_device_id():
-        """
-        获取mac地址作为device_id
-        :return:
-        """
-        try:
-            return get_mac_address()
-        except:
-            return None
-
-    """
-    内部方法，从params中移除公共参数
-    """
     def __remove_common_params(self, params):
+        """
+        内部方法，从params中移除公共参数
+        """
         if not params:
             return
         for k in COMMON_PARAM_KEYS:
             if k in params:
                 params.pop(k)
 
-    """
-    内部方法，通过请求request对象构造请求查询字符串和业务参数
-    """
-    def __prepare_request(self, request):
+    def __prepare_request(self, request, url=''):
+        """
+        内部方法，通过请求request对象构造请求查询字符串和业务参数
+        """
         THREAD_LOCAL.logger = self.__logger
         params = request.get_params()
         params[P_TIMESTAMP] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -90,6 +147,14 @@ class TigerOpenClient:
         all_params = dict()
         all_params.update(params)
         all_params.update(common_params)
+
+        # OAuth2 mode puts no signature field in the body at all
+        if self.__oauth2_mode:
+            if THREAD_LOCAL.logger:
+                THREAD_LOCAL.logger.debug('[' + THREAD_LOCAL.uuid + ']request:'
+                                          + url + '?' + get_sign_content(all_params))
+            return all_params
+
         sign_content = get_sign_content(all_params)
         try:
             sign = sign_with_rsa(self.__config.private_key, sign_content, self.__config.charset)
@@ -97,17 +162,16 @@ class TigerOpenClient:
             raise RequestException('[' + THREAD_LOCAL.uuid + ']request sign failed. ' + str(e))
         all_params[P_SIGN] = sign
 
-        log_url = self.__config.server_url + '?' + sign_content + "&sign=" + sign
+        log_url = url + '?' + sign_content + "&sign=" + sign
         if THREAD_LOCAL.logger:
             THREAD_LOCAL.logger.debug('[' + THREAD_LOCAL.uuid + ']request:' + log_url)
 
         return all_params
 
-    """
-    内部方法，解析请求返回结果并做验签
-    """
-
     def __parse_response(self, response_str, timestamp=None):
+        """
+        内部方法，解析请求返回结果并做验签
+        """
         response_str = response_str.decode(self.__config.charset)
         if THREAD_LOCAL.logger:
             THREAD_LOCAL.logger.debug('[' + THREAD_LOCAL.uuid + ']response:' + response_str)
@@ -130,16 +194,155 @@ class TigerOpenClient:
 
         return response_content
 
-    """
-    执行接口请求
-    """
+    def _update_header(self):
+        self.__headers['Authorization'] = self.__config.token
 
-    def execute(self, request):
+    def _get_retry_deco(self, service):
+        if service not in SKIP_RETRY_SERVICES and self.__config.retry_max_tries > 0:
+            extra = {}
+            if self.__oauth2_mode:
+                # OAuth 2.0 retry handling applies only in OAuth 2.0 mode.
+                extra['giveup'] = _giveup_on_unauthorized
+            return backoff.on_exception(backoff.fibo,
+                                        (RequestException, ResponseException),
+                                        max_time=self.__config.retry_max_time,
+                                        max_tries=self.__config.retry_max_tries,
+                                        logger=self.__logger,
+                                        on_giveup=lambda x: self.__logger.error(f'give up after '
+                                                                                f'{self.__config.retry_max_tries} retries'),
+                                        jitter=None,
+                                        **extra)
+        return None
+
+    def execute(self, request, url=None):
+        """
+        执行接口请求
+        """
+        if self.__config.token:
+            self._update_header()
+        if url is None:
+            url = self.__config.server_url
         THREAD_LOCAL.uuid = str(uuid.uuid1())
         query_string = None
-        params = self.__prepare_request(request)
+        params = self.__prepare_request(request, url)
 
-        response = do_post(self.__config.server_url, query_string, self.__headers, params, self.__config.timeout,
-                           self.__config.charset)
+        headers = self.__headers
+        attempt = None
+        # Authentication retry eligibility. Order mutations are excluded because a 401
+        # does not establish whether the server executed the request.
+        retryable = request._method not in SKIP_RETRY_SERVICES
+        if self.__oauth2_mode:
+            context = RequestAuthContext(params, retryable=retryable)
+            attempt = self.__authentication.apply(context)
+            # A per-request copy: Authorization is request-scoped, and mutating the
+            # shared dict would leak one request's token into another thread's request
+            headers = dict(self.__headers)
+            headers['Authorization'] = context.authorization_header
+
+        try:
+            response = self.__do_post(request, url, query_string, headers, params)
+        except ResponseException as e:
+            # attempt is always None in signature mode, so the exception propagates
+            # unchanged and behaviour matches the previous implementation
+            if attempt is None or not retryable or e.status != UNAUTHORIZED_STATUS:
+                raise
+            decision = self.__authentication.on_unauthorized(attempt, e.status)
+            if not decision.should_retry:
+                raise
+            headers = dict(headers)
+            headers['Authorization'] = decision.authorization_header
+            response = self.__do_post(request, url, query_string, headers, params)
 
         return self.__parse_response(response, params.get('timestamp'))
+
+    def __do_post(self, request, url, query_string, headers, params):
+        retry_deco = self._get_retry_deco(request._method)
+        if retry_deco is not None:
+            return retry_deco(do_post)(url, query_string, headers, params, self.__config.timeout,
+                                       self.__config.charset)
+        return do_post(url, query_string, headers, params, self.__config.timeout,
+                       self.__config.charset)
+
+    def query_license(self):
+        request = OpenApiRequest(method=USER_LICENSE)
+
+        response_content = None
+        try:
+            response_content = self.execute(request)
+        except Exception as e:
+            self.__logger.error(e, exc_info=True)
+        if response_content:
+            response = TigerResponse()
+            response.parse_response_content(response_content)
+            if response.is_success():
+                return response.data.get('license')
+        self.__logger.error(f"failed to query license, response: {response_content}")
+
+    def query_token(self):
+        request = OpenApiRequest(method=USER_TOKEN_REFRESH)
+
+        response_content = None
+        try:
+            response_content = self.execute(request)
+        except Exception as e:
+            self.__logger.error(e, exc_info=True)
+        if response_content:
+            response = TigerResponse()
+            response.parse_response_content(response_content)
+            if response.is_success():
+                return response.data.get('token')
+        self.__logger.error(f"failed to refresh token, response: {response_content}")
+        return None
+
+    def refresh_token(self):
+        self.__config.token = self.__config.load_token()
+        new_token = self.query_token()
+        if new_token:
+            self.__logger.info(f"refresh token, old:{self.__config.token}, new:{new_token}")
+            self.__config.store_token(new_token)
+
+    def __token_refresh_task(self):
+        try:
+            if self.__config.should_token_refresh():
+                self.refresh_token()
+        except Exception as e:
+            self.__logger.error(e, exc_info=True)
+
+    def __schedule_thread(self):
+        if not _SCHEDULE_STATE['is_running'] and self.__config.token_refresh_duration != 0:
+            _SCHEDULE_STATE['is_running'] = True
+            self.__logger.info('Starting token refresh thread...')
+            daemon = RepeatTimer(self.__config.token_check_interval, self.__token_refresh_task)
+            daemon.daemon = True
+            daemon.start()
+            self.__monitor_token()
+
+    def __monitor_token(self):
+        """对于多进程运行的情况，需监控token文件变动并加载，防止另一个进程刷新token后导致本进程token失效.
+        需安装watchdog实现此功能： pip install watchdog"""
+        try:
+            from watchdog.observers import Observer
+            from watchdog.events import FileSystemEventHandler
+        except ImportError:
+            return
+
+        def on_modified(event):
+            file_token = self.__config.load_token()
+            if file_token != self.__config.token:
+                self.__logger.info(f'load token from changed token file, old: {self.__config.token}, '
+                                   f'new:{file_token}')
+                self.__config.token = file_token
+
+        event_handler = FileSystemEventHandler()
+        event_handler.on_modified = on_modified
+        observer = Observer()
+        observer.schedule(event_handler, self.__config.get_token_path(), recursive=True)
+        observer.daemon = True
+        observer.start()
+        self.__logger.info('Starting token monitor thread...')
+
+
+class RepeatTimer(Timer):
+    def run(self):
+        while not self.finished.wait(self.interval):
+            self.function(*self.args, **self.kwargs)

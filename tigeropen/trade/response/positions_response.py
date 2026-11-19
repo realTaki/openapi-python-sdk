@@ -4,17 +4,13 @@ Created on 2018/10/31
 
 @author: gaoan
 """
-import json
-
 from tigeropen.common.response import TigerResponse
+from tigeropen.common.util import string_utils
 from tigeropen.trade.domain.contract import Contract
-from tigeropen.trade.domain.position import Position
+from tigeropen.trade.domain.position import Position, TradableQuantityItem
 from tigeropen.trade.response import CONTRACT_FIELDS
 
-POSITION_FIELD_MAPPINGS = {'averageCost': 'average_cost', 'position': 'quantity', 'latestPrice': 'market_price',
-                           'marketValue': 'market_value', 'orderType': 'order_type', 'realizedPnl': 'realized_pnl',
-                           'unrealizedPnl': 'unrealized_pnl', 'secType': 'sec_type', 'localSymbol': 'local_symbol',
-                           'originSymbol': 'origin_symbol', 'contractId': 'contract_id', 'identifier': 'identifier'}
+POSITION_FIELD_MAPPINGS = {'position': 'quantity', 'latestPrice': 'market_price'}
 
 
 class PositionsResponse(TigerResponse):
@@ -29,15 +25,15 @@ class PositionsResponse(TigerResponse):
             self._is_success = response['is_success']
         
         if self.data:
-            data_json = json.loads(self.data)
-            if 'items' in data_json:
-                for item in data_json['items']:
+            if 'items' in self.data:
+                for item in self.data['items']:
+
                     contract_fields = {}
                     position_fields = {}
                     for key, value in item.items():
                         if value is None:
                             continue
-                        tag = POSITION_FIELD_MAPPINGS[key] if key in POSITION_FIELD_MAPPINGS else key
+                        tag = POSITION_FIELD_MAPPINGS[key] if key in POSITION_FIELD_MAPPINGS else string_utils.camel_to_underline(key)
                         if tag in CONTRACT_FIELDS:
                             contract_fields[tag] = value
                         else:
@@ -55,19 +51,29 @@ class PositionsResponse(TigerResponse):
                     put_call = contract_fields.get('right')
                     multiplier = contract_fields.get('multiplier')
                     identifier = contract_fields.get('identifier')
+                    market = contract_fields.get('market')
+                    categories = contract_fields.get('categories')
+                    name = contract_fields.get('name')
+                    underlying_contract_name = contract_fields.get('underlying_contract_name')
                     contract = Contract(symbol, currency, contract_id=contract_id, sec_type=sec_type,
                                         exchange=exchange, origin_symbol=origin_symbol, local_symbol=local_symbol,
                                         expiry=expiry, strike=strike, put_call=put_call, multiplier=multiplier,
-                                        identifier=identifier)
-                    account = position_fields.get('account')
-                    quantity = position_fields.get('quantity')
-                    average_cost = position_fields.get('average_cost')
-                    market_price = position_fields.get('market_price')
-                    market_value = position_fields.get('market_value')
-                    realized_pnl = position_fields.get('realized_pnl')
-                    unrealized_pnl = position_fields.get('unrealized_pnl')
-                    
-                    position = Position(account, contract, quantity, average_cost=average_cost,
-                                        market_price=market_price, market_value=market_value,
-                                        realized_pnl=realized_pnl, unrealized_pnl=unrealized_pnl)
+                                        identifier=identifier, market=market, categories=categories, name=name,
+                                        underlying_contract_name=underlying_contract_name)
+                    position = Position(contract=contract, **position_fields)
                     self.positions.append(position)
+
+
+class EstimateTradableQuantityResponse(TigerResponse):
+    def __init__(self):
+        super(EstimateTradableQuantityResponse, self).__init__()
+        self.result = None
+        self._is_success = None
+
+    def parse_response_content(self, response_content):
+        response = super(EstimateTradableQuantityResponse, self).parse_response_content(response_content)
+        if 'is_success' in response:
+            self._is_success = response['is_success']
+
+        if self.data:
+            self.result = TradableQuantityItem(**string_utils.camel_to_underline_obj(self.data))

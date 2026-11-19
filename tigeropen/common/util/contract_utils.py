@@ -5,6 +5,7 @@ Created on 2018/11/1
 @author: gaoan
 """
 import re
+from datetime import datetime
 
 from tigeropen.common.consts import SecurityType
 from tigeropen.trade.domain.contract import Contract
@@ -45,6 +46,15 @@ def cash_contract(symbol, currency, local_symbol=None):
     return Contract(symbol, currency, sec_type='CASH', local_symbol=local_symbol)
 
 
+def fund_contract(symbol):
+    return Contract(symbol, sec_type=SecurityType.FUND.value)
+
+
+def cc_contract(symbol, currency='USD'):
+    """数字货币合约"""
+    return Contract(symbol, currency, sec_type=SecurityType.CC.value)
+
+
 def war_contract_by_symbol(symbol, expiry, strike, put_call, local_symbol, multiplier=100, currency='HKD',
                            contract_id=None):
     """港股窝轮"""
@@ -66,7 +76,7 @@ def extract_option_info(identifier):
     :return:
     """
     if identifier:
-        tokens = re.findall(r'(\w+)\s*(\d{6})([CP])(\d+)', identifier, re.M)
+        tokens = re.findall(r'(\w+(?:\.\w+)?)\s*(\d{6})([CP])(\d+)', identifier, re.M)
         if len(tokens) == 1:
             underlying_symbol, expiry, put_call, strike = tokens[0]
             expiry = '20' + expiry
@@ -89,4 +99,12 @@ def get_option_identifier(underlying_symbol, expiry, put_call, strike):
     :return:
     """
     direction = 'C' if put_call == 'C' or put_call == 'CALL' else 'P'
+    if isinstance(expiry, int):
+        expiry = datetime.fromtimestamp(expiry / 1000).strftime('%Y%m%d')
+    if isinstance(strike, str):
+        strike = float(strike)
     return underlying_symbol.ljust(6, ' ') + expiry[2:] + direction + str(int(strike * 1000)).zfill(8)
+
+
+def is_hk_option_underlying_symbol(underlying_symbol):
+    return underlying_symbol and underlying_symbol.endswith('.HK')

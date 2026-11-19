@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # Helpers for calculating the Greeks of options
+# requires QuantLib>=1.40
 # @Date    : 2022/4/15
 # @Author  : sukai
 import argparse
@@ -7,11 +8,16 @@ from typing import List
 
 try:
     import QuantLib as ql
-except ImportError:
-    pass
+except ImportError as e:
+    # The class definitions below evaluate `ql.*` at import time (base classes and
+    # default argument values), so a missing QuantLib cannot be tolerated lazily.
+    # Fail with an actionable message instead of a bare NameError.
+    raise ImportError(
+        "QuantLib is required for this module to work. Please install QuantLib (>=1.40)."
+    ) from e
 
 
-class FDDividendOptionHelper(ql.DividendVanillaOption):
+class FDDividendOptionHelper(ql.VanillaOption):
     def __init__(self,
                  engine_class,
                  option_type: ql.Option,
@@ -29,8 +35,8 @@ class FDDividendOptionHelper(ql.DividendVanillaOption):
                  ):
         self.dates = dates if dates is not None else list()
         self.dividends = dividends if dividends is not None else list()
-        super(FDDividendOptionHelper, self).__init__(ql.PlainVanillaPayoff(option_type, strike), exercise, self.dates,
-                                                     self.dividends)
+        super(FDDividendOptionHelper, self).__init__(ql.PlainVanillaPayoff(option_type, strike), exercise)
+
 
         self.option_type = option_type
         self.underlying = underlying
@@ -114,7 +120,11 @@ class FDDividendOptionHelper(ql.DividendVanillaOption):
             if try_times == 0:
                 return 0
             elif 'root not bracketed' in str(e):
-                return self.implied_volatility(price, accuracy, max_evaluations, min_vol, max_vol * 2, try_times - 1)
+                # Pass every argument by keyword: the original code forwarded these
+                # positionally, which shifted `accuracy` into the `price` slot and
+                # made each retry solve for the wrong price.
+                return self.implied_volatility(price, accuracy=accuracy, max_evaluations=max_evaluations,
+                                               min_vol=min_vol, max_vol=max_vol * 2, try_times=try_times - 1)
             else:
                 raise e
 
@@ -130,7 +140,11 @@ class FDDividendOptionHelper(ql.DividendVanillaOption):
         :return:
         """
         sigma0 = quote.value()
-        h = sigma0 * 1E-4
+        # A purely relative step collapses to 0 when sigma0 is 0, which happens in
+        # practice: implied_volatility() returns 0 when the solver fails to bracket
+        # a root, and a risk-free rate of 0 is a normal input for rho(). Fall back to
+        # an absolute step so the central difference below stays well defined.
+        h = abs(sigma0) * 1E-4 or 1E-7
         quote.setValue(sigma0 - h)
         p_minus = self.NPV()
         quote.setValue(sigma0 + h)
@@ -155,7 +169,7 @@ class FDAmericanDividendOptionHelper(FDDividendOptionHelper):
                  dividends: List[float] = None,
                  calendar: ql.Calendar = ql.NullCalendar(),
                  day_counter: ql.DayCounter = ql.Actual365Fixed(),
-                 engine_class: ql.PricingEngine.__class__ = ql.FdBlackScholesVanillaEngine
+                 engine_class: ql.PricingEngine = ql.FdBlackScholesVanillaEngine
                  ):
         """
 
@@ -208,7 +222,7 @@ class FDEuropeanDividendOptionHelper(FDDividendOptionHelper):
                  dividends: List[float] = None,
                  calendar: ql.Calendar = ql.NullCalendar(),
                  day_counter: ql.DayCounter = ql.Actual365Fixed(),
-                 engine_class: ql.PricingEngine.__class__ = ql.FdBlackScholesVanillaEngine
+                 engine_class: ql.PricingEngine = ql.FdBlackScholesVanillaEngine
                  ):
         super(FDEuropeanDividendOptionHelper, self).__init__(engine_class=engine_class,
                                                              option_type=option_type, underlying=underlying,
@@ -223,7 +237,7 @@ class FDEuropeanDividendOptionHelper(FDDividendOptionHelper):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Helpers for calculating the Greeks of options')
 
-    parser.add_argument('-t', '--type', type=str,
+    parser.add_argument('-t', '--type', type=str, default='CALL',
                         help='Option type, CALL/PUT (C/P)', choices=('C', 'P', 'CALL', 'PUT'))
     parser.add_argument('-u', '--underlying', type=float,
                         help='The price of the underlying asset')
@@ -259,7 +273,18 @@ if __name__ == '__main__':
     if args.volatility is None and args.npv is None and args.ask is None and args.bid is None:
         parser.error('Must specify the volatility or option npv(or option\'s ask, bid)')
 
-    print(args.__dict__)
+    # args.settlement = '2026/01/18'
+    # args.expiration = '2026/02/20'
+    # args.type = 'C'
+    # args.underlying = 437.5
+    # args.strike = 385
+    # args.rfrate = 0.03553
+    # args.dividend = 0.00
+    # args.volatility = 0
+    # args.npv = None
+    # args.ask = 59.55
+    # args.bid = args.ask
+
     settlement_date = ql.DateParser.parseFormatted(str(args.settlement).replace('/', '-'), '%Y-%m-%d')
     expiration_date = ql.DateParser.parseFormatted(str(args.expiration).replace('/', '-'), '%Y-%m-%d')
 
@@ -268,6 +293,7 @@ if __name__ == '__main__':
     else:
         helper_class = FDAmericanDividendOptionHelper
 
+    ql.Settings.instance().evaluationDate = settlement_date
     helper = helper_class(option_type=ql_option_type,
                           underlying=args.underlying,
                           strike=args.strike,
